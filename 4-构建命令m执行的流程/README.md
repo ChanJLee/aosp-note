@@ -335,10 +335,7 @@ func runSoong(ctx Context, config Config) {
 		}
 	}()
 
-	var cfg microfactory.Config
-	cfg.Map("github.com/google/blueprint", "build/blueprint")
-
-	cfg.TrimPath = absPath(ctx, ".")
+	// ...
 
 	func() {
 		ctx.BeginTrace(metrics.RunSoong, "minibp")
@@ -389,23 +386,239 @@ func runSoong(ctx Context, config Config) {
 	ninja("bootstrap", ".bootstrap/build.ninja")
 
 	soongBuildMetrics := loadSoongBuildMetrics(ctx, config)
-	logSoongBuildMetrics(ctx, soongBuildMetrics)
-
-	distGzipFile(ctx, config, config.SoongNinjaFile(), "soong")
-
-	if !config.SkipMake() {
-		distGzipFile(ctx, config, config.SoongAndroidMk(), "soong")
-		distGzipFile(ctx, config, config.SoongMakeVarsMk(), "soong")
-	}
-
-	if ctx.Metrics != nil {
-		ctx.Metrics.SetSoongBuildMetrics(soongBuildMetrics)
-	}
+	// ...
 }                                                                                                                                                                                                                
 ```
 
+1. 首先调用 build/blueprint/bootstrap.bash 这个文件的作用是检查ninja的运行参数
+
+2. 然后调用soong_env， soong_env的源码在 build/soong/cmd/soong_env下，这个主要检查 out/.soong.environment 下的环境变量
+
+3. 构建 minibp 
+
+4. 构建 bpglob
+
+5. 调用ninja生成 out/.minibootstrap/build.ninja out/.bootstrap/build.ninja 
+
+6. 读取soong metrics文件
+
 ## 构建ckati
+
+```go
+genKatiSuffix(ctx, config)
+runKatiCleanSpec(ctx, config)
+runKatiBuild(ctx, config)
+runKatiPackage(ctx, config)
+```
+
+构建ckati分为四步，第一步获取kati的后缀，主要是通过TargetProduct来进行构造字符串。第二runKatiCleanSpec
+
+```go
+
+func runKatiCleanSpec(ctx Context, config Config) {
+	ctx.BeginTrace(metrics.RunKati, "kati cleanspec")
+	defer ctx.EndTrace()
+
+	runKati(ctx, config, katiCleanspecSuffix, []string{
+		"--werror_implicit_rules",
+		"--werror_overriding_commands",
+		"-f", "build/make/core/cleanbuild.mk",
+		"SOONG_MAKEVARS_MK=" + config.SoongMakeVarsMk(),
+		"TARGET_DEVICE_DIR=" + config.TargetDeviceDir(),
+	}, func(env *Environment) {})
+}
+```
+
+调用ckati进行清理工作，然后再构建。
 
 ## 合并ninja文件
 
+```go
+func createCombinedBuildNinjaFile(ctx Context, config Config) {
+	// If we're in SkipMake mode, skip creating this file if it already exists
+	if config.SkipMake() {
+		if _, err := os.Stat(config.CombinedNinjaFile()); err == nil || !os.IsNotExist(err) {
+			return
+		}
+	}
+
+	file, err := os.Create(config.CombinedNinjaFile())
+	if err != nil {
+		ctx.Fatalln("Failed to create combined ninja file:", err)
+	}
+	defer file.Close()
+
+	if err := combinedBuildNinjaTemplate.Execute(file, config); err != nil {
+		ctx.Fatalln("Failed to write combined ninja file:", err)
+	}
+}
+```
+
+创建一个临时ninja文件，并且合并它
+
 ## 通过ninja构建
+
+```go
+func runNinja(ctx Context, config Config) {
+	ctx.BeginTrace(metrics.PrimaryNinja, "ninja")
+	defer ctx.EndTrace()
+
+	fifo := filepath.Join(config.OutDir(), ".ninja_fifo")
+	nr := status.NewNinjaReader(ctx, ctx.Status.StartTool(), fifo)
+	defer nr.Close()
+
+	executable := config.PrebuiltBuildTool("ninja")
+	args := []string{
+		"-d", "keepdepfile",
+		"-d", "keeprsp",
+		"-d", "stats",
+		"--frontend_file", fifo,
+	}
+
+	args = append(args, config.NinjaArgs()...)
+
+	var parallel int
+	if config.UseRemoteBuild() {
+		parallel = config.RemoteParallel()
+	} else {
+		parallel = config.Parallel()
+	}
+	args = append(args, "-j", strconv.Itoa(parallel))
+	if config.keepGoing != 1 {
+		args = append(args, "-k", strconv.Itoa(config.keepGoing))
+	}
+
+	args = append(args, "-f", config.CombinedNinjaFile())
+
+	args = append(args,
+		"-o", "usesphonyoutputs=yes",
+		"-w", "dupbuild=err",
+		"-w", "missingdepfile=err")
+
+	cmd := Command(ctx, config, "ninja", executable, args...)
+	cmd.Sandbox = ninjaSandbox
+	if config.HasKatiSuffix() {
+		cmd.Environment.AppendFromKati(config.KatiEnvFile())
+	}
+
+	// Allow both NINJA_ARGS and NINJA_EXTRA_ARGS, since both have been
+	// used in the past to specify extra ninja arguments.
+	if extra, ok := cmd.Environment.Get("NINJA_ARGS"); ok {
+		cmd.Args = append(cmd.Args, strings.Fields(extra)...)
+	}
+	if extra, ok := cmd.Environment.Get("NINJA_EXTRA_ARGS"); ok {
+		cmd.Args = append(cmd.Args, strings.Fields(extra)...)
+	}
+
+	logPath := filepath.Join(config.OutDir(), ".ninja_log")
+	ninjaHeartbeatDuration := time.Minute * 5
+	if overrideText, ok := cmd.Environment.Get("NINJA_HEARTBEAT_INTERVAL"); ok {
+		// For example, "1m"
+		overrideDuration, err := time.ParseDuration(overrideText)
+		if err == nil && overrideDuration.Seconds() > 0 {
+			ninjaHeartbeatDuration = overrideDuration
+		}
+	}
+
+	// Filter the environment, as ninja does not rebuild files when environment variables change.
+	//
+	// Anything listed here must not change the output of rules/actions when the value changes,
+	// otherwise incremental builds may be unsafe. Vars explicitly set to stable values
+	// elsewhere in soong_ui are fine.
+	//
+	// For the majority of cases, either Soong or the makefiles should be replicating any
+	// necessary environment variables in the command line of each action that needs it.
+	if cmd.Environment.IsEnvTrue("ALLOW_NINJA_ENV") {
+		ctx.Println("Allowing all environment variables during ninja; incremental builds may be unsafe.")
+	} else {
+		cmd.Environment.Allow(append([]string{
+			"ASAN_SYMBOLIZER_PATH",
+			"HOME",
+			"JAVA_HOME",
+			"LANG",
+			"LC_MESSAGES",
+			"OUT_DIR",
+			"PATH",
+			"PWD",
+			"PYTHONDONTWRITEBYTECODE",
+			"TMPDIR",
+			"USER",
+
+			// TODO: remove these carefully
+			"ASAN_OPTIONS",
+			"TARGET_BUILD_APPS",
+			"TARGET_BUILD_VARIANT",
+			"TARGET_PRODUCT",
+			// b/147197813 - used by art-check-debug-apex-gen
+			"EMMA_INSTRUMENT_FRAMEWORK",
+
+			// Goma -- gomacc may not need all of these
+			"GOMA_DIR",
+			"GOMA_DISABLED",
+			"GOMA_FAIL_FAST",
+			"GOMA_FALLBACK",
+			"GOMA_GCE_SERVICE_ACCOUNT",
+			"GOMA_TMP_DIR",
+			"GOMA_USE_LOCAL",
+
+			// RBE client
+			"RBE_compare",
+			"RBE_exec_root",
+			"RBE_exec_strategy",
+			"RBE_invocation_id",
+			"RBE_log_dir",
+			"RBE_platform",
+			"RBE_remote_accept_cache",
+			"RBE_remote_update_cache",
+			"RBE_server_address",
+			// TODO: remove old FLAG_ variables.
+			"FLAG_compare",
+			"FLAG_exec_root",
+			"FLAG_exec_strategy",
+			"FLAG_invocation_id",
+			"FLAG_log_dir",
+			"FLAG_platform",
+			"FLAG_remote_accept_cache",
+			"FLAG_remote_update_cache",
+			"FLAG_server_address",
+
+			// ccache settings
+			"CCACHE_COMPILERCHECK",
+			"CCACHE_SLOPPINESS",
+			"CCACHE_BASEDIR",
+			"CCACHE_CPP2",
+			"CCACHE_DIR",
+		}, config.BuildBrokenNinjaUsesEnvVars()...)...)
+	}
+
+	cmd.Environment.Set("DIST_DIR", config.DistDir())
+	cmd.Environment.Set("SHELL", "/bin/bash")
+
+	ctx.Verboseln("Ninja environment: ")
+	envVars := cmd.Environment.Environ()
+	sort.Strings(envVars)
+	for _, envVar := range envVars {
+		ctx.Verbosef("  %s", envVar)
+	}
+
+	// Poll the ninja log for updates; if it isn't updated enough, then we want to show some diagnostics
+	done := make(chan struct{})
+	defer close(done)
+	ticker := time.NewTicker(ninjaHeartbeatDuration)
+	defer ticker.Stop()
+	checker := &statusChecker{}
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				checker.check(ctx, config, logPath)
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	ctx.Status.Status("Starting ninja...")
+	cmd.RunAndStreamOrFatal()
+}
+```
