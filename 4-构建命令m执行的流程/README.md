@@ -622,3 +622,5 @@ func runNinja(ctx Context, config Config) {
 	cmd.RunAndStreamOrFatal()
 }
 ```
+
+在运行ninja之前，设置一堆环境变量，然后进行构建。
