@@ -1,6 +1,14 @@
 # app_process启动流程
 
-frameworks/base/cmds/app_process/app_main.cpp
+app_process的启动命令在system/core/rootdir/init.zygote64.rc中
+
+```shell
+app_process -Xzygote /system/bin --zygote --start-system-server
+```
+
+这些参数会传递给 app_process的main函数，app_process的代码在
+
+frameworks/base/cmds/app_process/app_main.cpp 中
 
 ```cpp
 int main(int argc, char* const argv[])
@@ -254,7 +262,417 @@ ZygoteInit主要做了这几件事：
 
 ## ZygoteInit启动系统服务
 
+启动system server在forkSystemServer函数中进行
 
+```java
+   private static Runnable forkSystemServer(String abiList, String socketName,
+            ZygoteServer zygoteServer) {
+        // ...
+        String args[] = {
+                "--setuid=1000",
+                "--setgid=1000",
+                "--setgroups=1001,1002,1003,1004,1005,1006,1007,1008,1009,1010,1018,1021,1023,"
+                        + "1024,1032,1065,3001,3002,3003,3006,3007,3009,3010,3011",
+                "--capabilities=" + capabilities + "," + capabilities,
+                "--nice-name=system_server",
+                "--runtime-args",
+                "--target-sdk-version=" + VMRuntime.SDK_VERSION_CUR_DEVELOPMENT,
+                "com.android.server.SystemServer",
+        };
+        // ...
+        int pid;
+
+        try {
+            // ...
+            /* Request to fork the system server process */
+            pid = Zygote.forkSystemServer(
+                    parsedArgs.mUid, parsedArgs.mGid,
+                    parsedArgs.mGids,
+                    parsedArgs.mRuntimeFlags,
+                    null,
+                    parsedArgs.mPermittedCapabilities,
+                    parsedArgs.mEffectiveCapabilities);
+        } catch (IllegalArgumentException ex) {
+            throw new RuntimeException(ex);
+        }
+
+        /* For child process */
+        if (pid == 0) {
+            if (hasSecondZygote(abiList)) {
+                waitForSecondaryZygote(socketName);
+            }
+
+            zygoteServer.closeServerSocket();
+            return handleSystemServerProcess(parsedArgs);
+        }
+
+        return null;
+    }
+```
+
+forkSystemServer主要还是调用native的方法
+
+```java
+static int forkSystemServer(int uid, int gid, int[] gids, int runtimeFlags,
+            int[][] rlimits, long permittedCapabilities, long effectiveCapabilities) {
+        ZygoteHooks.preFork();
+
+        int pid = nativeForkSystemServer(
+                uid, gid, gids, runtimeFlags, rlimits,
+                permittedCapabilities, effectiveCapabilities);
+
+        // Set the Java Language thread priority to the default value for new apps.
+        Thread.currentThread().setPriority(Thread.NORM_PRIORITY);
+
+        ZygoteHooks.postForkCommon();
+        return pid;
+    }
+```
+
+然后handleSystemServerProcess返回一个Runnable对象
+
+```java
+ private static Runnable handleSystemServerProcess(ZygoteArguments parsedArgs) {
+        // ...
+
+        if (parsedArgs.mInvokeWith != null) {
+            // ...
+        } else {
+            ClassLoader cl = null;
+            if (systemServerClasspath != null) {
+                cl = createPathClassLoader(systemServerClasspath, parsedArgs.mTargetSdkVersion);
+
+                Thread.currentThread().setContextClassLoader(cl);
+            }
+
+            /*
+             * Pass the remaining arguments to SystemServer.
+             */
+            return ZygoteInit.zygoteInit(parsedArgs.mTargetSdkVersion,
+                    parsedArgs.mDisabledCompatChanges,
+                    parsedArgs.mRemainingArgs, cl);
+        }
+
+        /* should never reach here */
+    }
+```
+
+实际调用转发到zygoteInit函数中
+
+```java
+ public static final Runnable zygoteInit(int targetSdkVersion, long[] disabledCompatChanges,
+            String[] argv, ClassLoader classLoader) {
+        // ...
+        RuntimeInit.commonInit();
+        ZygoteInit.nativeZygoteInit();
+        return RuntimeInit.applicationInit(targetSdkVersion, disabledCompatChanges, argv,
+                classLoader);
+    }
+```
+
+接着调用applicationInit函数
+```java
+protected static Runnable applicationInit(int targetSdkVersion, long[] disabledCompatChanges,
+            String[] argv, ClassLoader classLoader) {
+        // If the application calls System.exit(), terminate the process
+        // immediately without running any shutdown hooks.  It is not possible to
+        // shutdown an Android application gracefully.  Among other things, the
+        // Android runtime shutdown hooks close the Binder driver, which can cause
+        // leftover running threads to crash before the process actually exits.
+        nativeSetExitWithoutCleanup(true);
+
+        VMRuntime.getRuntime().setTargetSdkVersion(targetSdkVersion);
+        VMRuntime.getRuntime().setDisabledCompatChanges(disabledCompatChanges);
+
+        final Arguments args = new Arguments(argv);
+
+        // The end of of the RuntimeInit event (see #zygoteInit).
+        Trace.traceEnd(Trace.TRACE_TAG_ACTIVITY_MANAGER);
+
+        // Remaining arguments are passed to the start class's static main
+        return findStaticMain(args.startClass, args.startArgs, classLoader);
+    }
+```
+
+最后调用会转发到findStaticMain函数中，注意这里传入了一个startClass, 这个值在forkSystemServer的时候就制定了即com.android.server.SystemServer
+
+```java
+   protected static Runnable findStaticMain(String className, String[] argv,
+            ClassLoader classLoader) {
+        Class<?> cl;
+
+        try {
+            cl = Class.forName(className, true, classLoader);
+        } catch (ClassNotFoundException ex) {
+            throw new RuntimeException(
+                    "Missing class when invoking static main " + className,
+                    ex);
+        }
+
+        Method m;
+        try {
+            m = cl.getMethod("main", new Class[] { String[].class });
+        } catch (NoSuchMethodException ex) {
+            throw new RuntimeException(
+                    "Missing static main on " + className, ex);
+        } catch (SecurityException ex) {
+            throw new RuntimeException(
+                    "Problem getting static main on " + className, ex);
+        }
+
+        int modifiers = m.getModifiers();
+        if (! (Modifier.isStatic(modifiers) && Modifier.isPublic(modifiers))) {
+            throw new RuntimeException(
+                    "Main method is not public and static on " + className);
+        }
+
+        /*
+         * This throw gets caught in ZygoteInit.main(), which responds
+         * by invoking the exception's run() method. This arrangement
+         * clears up all the stack frames that were required in setting
+         * up the process.
+         */
+        return new MethodAndArgsCaller(m, argv);
+    }
+```
+
+MathodAndArgsCaller的定义如下
+
+```java
+   static class MethodAndArgsCaller implements Runnable {
+        /** method to call */
+        private final Method mMethod;
+
+        /** argument array */
+        private final String[] mArgs;
+
+        public MethodAndArgsCaller(Method method, String[] args) {
+            mMethod = method;
+            mArgs = args;
+        }
+
+        public void run() {
+            try {
+                mMethod.invoke(null, new Object[] { mArgs });
+            } catch (IllegalAccessException ex) {
+                throw new RuntimeException(ex);
+            } catch (InvocationTargetException ex) {
+                Throwable cause = ex.getCause();
+                if (cause instanceof RuntimeException) {
+                    throw (RuntimeException) cause;
+                } else if (cause instanceof Error) {
+                    throw (Error) cause;
+                }
+                throw new RuntimeException(ex);
+            }
+        }
+    }
+```
+
+其实就是反射调用main函数
+
+SystemServer在/home/chan/Documents/aosp/frameworks/base/services/java/com/android/server/SystemServer.java中定义
+
+```java
+    public static void main(String[] args) {
+        new SystemServer().run();
+    }
+```
+
+先new了一个SystemServer实例，然后调用它的run方法
+
+```java
+ private void run() {
+        // ...
+        try {
+            t.traceBegin("InitBeforeStartServices");
+
+            // Record the process start information in sys props.
+            SystemProperties.set(SYSPROP_START_COUNT, String.valueOf(mStartCount));
+            SystemProperties.set(SYSPROP_START_ELAPSED, String.valueOf(mRuntimeStartElapsedTime));
+            SystemProperties.set(SYSPROP_START_UPTIME, String.valueOf(mRuntimeStartUptime));
+
+            EventLog.writeEvent(EventLogTags.SYSTEM_SERVER_START,
+                    mStartCount, mRuntimeStartUptime, mRuntimeStartElapsedTime);
+
+            //
+            // Default the timezone property to GMT if not set.
+            //
+            String timezoneProperty = SystemProperties.get("persist.sys.timezone");
+            if (!isValidTimeZoneId(timezoneProperty)) {
+                Slog.w(TAG, "persist.sys.timezone is not valid (" + timezoneProperty
+                        + "); setting to GMT.");
+                SystemProperties.set("persist.sys.timezone", "GMT");
+            }
+
+            // If the system has "persist.sys.language" and friends set, replace them with
+            // "persist.sys.locale". Note that the default locale at this point is calculated
+            // using the "-Duser.locale" command line flag. That flag is usually populated by
+            // AndroidRuntime using the same set of system properties, but only the system_server
+            // and system apps are allowed to set them.
+            //
+            // NOTE: Most changes made here will need an equivalent change to
+            // core/jni/AndroidRuntime.cpp
+            if (!SystemProperties.get("persist.sys.language").isEmpty()) {
+                final String languageTag = Locale.getDefault().toLanguageTag();
+
+                SystemProperties.set("persist.sys.locale", languageTag);
+                SystemProperties.set("persist.sys.language", "");
+                SystemProperties.set("persist.sys.country", "");
+                SystemProperties.set("persist.sys.localevar", "");
+            }
+
+            // The system server should never make non-oneway calls
+            Binder.setWarnOnBlocking(true);
+            // The system server should always load safe labels
+            PackageItemInfo.forceSafeLabels();
+
+            // Default to FULL within the system server.
+            SQLiteGlobal.sDefaultSyncMode = SQLiteGlobal.SYNC_MODE_FULL;
+
+            // Deactivate SQLiteCompatibilityWalFlags until settings provider is initialized
+            SQLiteCompatibilityWalFlags.init(null);
+
+            // Here we go!
+            Slog.i(TAG, "Entered the Android system server!");
+            final long uptimeMillis = SystemClock.elapsedRealtime();
+            EventLog.writeEvent(EventLogTags.BOOT_PROGRESS_SYSTEM_RUN, uptimeMillis);
+            if (!mRuntimeRestart) {
+                FrameworkStatsLog.write(FrameworkStatsLog.BOOT_TIME_EVENT_ELAPSED_TIME_REPORTED,
+                        FrameworkStatsLog
+                                .BOOT_TIME_EVENT_ELAPSED_TIME__EVENT__SYSTEM_SERVER_INIT_START,
+                        uptimeMillis);
+            }
+
+            // In case the runtime switched since last boot (such as when
+            // the old runtime was removed in an OTA), set the system
+            // property so that it is in sync. We can't do this in
+            // libnativehelper's JniInvocation::Init code where we already
+            // had to fallback to a different runtime because it is
+            // running as root and we need to be the system user to set
+            // the property. http://b/11463182
+            SystemProperties.set("persist.sys.dalvik.vm.lib.2", VMRuntime.getRuntime().vmLibrary());
+
+            // Mmmmmm... more memory!
+            VMRuntime.getRuntime().clearGrowthLimit();
+
+            // Some devices rely on runtime fingerprint generation, so make sure
+            // we've defined it before booting further.
+            Build.ensureFingerprintProperty();
+
+            // Within the system server, it is an error to access Environment paths without
+            // explicitly specifying a user.
+            Environment.setUserRequired(true);
+
+            // Within the system server, any incoming Bundles should be defused
+            // to avoid throwing BadParcelableException.
+            BaseBundle.setShouldDefuse(true);
+
+            // Within the system server, when parceling exceptions, include the stack trace
+            Parcel.setStackTraceParceling(true);
+
+            // Ensure binder calls into the system always run at foreground priority.
+            BinderInternal.disableBackgroundScheduling(true);
+
+            // Increase the number of binder threads in system_server
+            BinderInternal.setMaxThreads(sMaxBinderThreads);
+
+            // Prepare the main looper thread (this thread).
+            android.os.Process.setThreadPriority(
+                    android.os.Process.THREAD_PRIORITY_FOREGROUND);
+            android.os.Process.setCanSelfBackground(false);
+            Looper.prepareMainLooper();
+            Looper.getMainLooper().setSlowLogThresholdMs(
+                    SLOW_DISPATCH_THRESHOLD_MS, SLOW_DELIVERY_THRESHOLD_MS);
+
+            SystemServiceRegistry.sEnableServiceNotFoundWtf = true;
+
+            // Initialize native services.
+            System.loadLibrary("android_servers");
+
+            // Allow heap / perf profiling.
+            initZygoteChildHeapProfiling();
+
+            // Debug builds - spawn a thread to monitor for fd leaks.
+            if (Build.IS_DEBUGGABLE) {
+                spawnFdLeakCheckThread();
+            }
+
+            // Check whether we failed to shut down last time we tried.
+            // This call may not return.
+            performPendingShutdown();
+
+            // Initialize the system context.
+            createSystemContext();
+
+            // Call per-process mainline module initialization.
+            ActivityThread.initializeMainlineModules();
+
+            // Create the system service manager.
+            mSystemServiceManager = new SystemServiceManager(mSystemContext);
+            mSystemServiceManager.setStartInfo(mRuntimeRestart,
+                    mRuntimeStartElapsedTime, mRuntimeStartUptime);
+            LocalServices.addService(SystemServiceManager.class, mSystemServiceManager);
+            // Prepare the thread pool for init tasks that can be parallelized
+            SystemServerInitThreadPool.start();
+            // Attach JVMTI agent if this is a debuggable build and the system property is set.
+            if (Build.IS_DEBUGGABLE) {
+                // Property is of the form "library_path=parameters".
+                String jvmtiAgent = SystemProperties.get("persist.sys.dalvik.jvmtiagent");
+                if (!jvmtiAgent.isEmpty()) {
+                    int equalIndex = jvmtiAgent.indexOf('=');
+                    String libraryPath = jvmtiAgent.substring(0, equalIndex);
+                    String parameterList =
+                            jvmtiAgent.substring(equalIndex + 1, jvmtiAgent.length());
+                    // Attach the agent.
+                    try {
+                        Debug.attachJvmtiAgent(libraryPath, parameterList, null);
+                    } catch (Exception e) {
+                        Slog.e("System", "*************************************************");
+                        Slog.e("System", "********** Failed to load jvmti plugin: " + jvmtiAgent);
+                    }
+                }
+            }
+        } finally {
+            t.traceEnd();  // InitBeforeStartServices
+        }
+
+        // Setup the default WTF handler
+        RuntimeInit.setDefaultApplicationWtfHandler(SystemServer::handleEarlySystemWtf);
+
+        // Start services.
+        try {
+            t.traceBegin("StartServices");
+            startBootstrapServices(t);
+            startCoreServices(t);
+            startOtherServices(t);
+        } catch (Throwable ex) {
+            Slog.e("System", "******************************************");
+            Slog.e("System", "************ Failure starting system services", ex);
+            throw ex;
+        } finally {
+            t.traceEnd(); // StartServices
+        }
+
+        StrictMode.initVmDefaults(null);
+
+        if (!mRuntimeRestart && !isFirstBootOrUpgrade()) {
+            final long uptimeMillis = SystemClock.elapsedRealtime();
+            FrameworkStatsLog.write(FrameworkStatsLog.BOOT_TIME_EVENT_ELAPSED_TIME_REPORTED,
+                    FrameworkStatsLog.BOOT_TIME_EVENT_ELAPSED_TIME__EVENT__SYSTEM_SERVER_READY,
+                    uptimeMillis);
+            final long maxUptimeMillis = 60 * 1000;
+            if (uptimeMillis > maxUptimeMillis) {
+                Slog.wtf(SYSTEM_SERVER_TIMING_TAG,
+                        "SystemServer init took too long. uptimeMillis=" + uptimeMillis);
+            }
+        }
+
+        // Loop forever.
+        Looper.loop();
+        throw new RuntimeException("Main thread loop unexpectedly exited");
+    }
+```
 
 ## ZygoteInit从应用进程fork
 
