@@ -486,41 +486,7 @@ SystemServer在/home/chan/Documents/aosp/frameworks/base/services/java/com/andro
         // ...
         try {
             t.traceBegin("InitBeforeStartServices");
-
-            // Record the process start information in sys props.
-            SystemProperties.set(SYSPROP_START_COUNT, String.valueOf(mStartCount));
-            SystemProperties.set(SYSPROP_START_ELAPSED, String.valueOf(mRuntimeStartElapsedTime));
-            SystemProperties.set(SYSPROP_START_UPTIME, String.valueOf(mRuntimeStartUptime));
-
-            EventLog.writeEvent(EventLogTags.SYSTEM_SERVER_START,
-                    mStartCount, mRuntimeStartUptime, mRuntimeStartElapsedTime);
-
-            //
-            // Default the timezone property to GMT if not set.
-            //
-            String timezoneProperty = SystemProperties.get("persist.sys.timezone");
-            if (!isValidTimeZoneId(timezoneProperty)) {
-                Slog.w(TAG, "persist.sys.timezone is not valid (" + timezoneProperty
-                        + "); setting to GMT.");
-                SystemProperties.set("persist.sys.timezone", "GMT");
-            }
-
-            // If the system has "persist.sys.language" and friends set, replace them with
-            // "persist.sys.locale". Note that the default locale at this point is calculated
-            // using the "-Duser.locale" command line flag. That flag is usually populated by
-            // AndroidRuntime using the same set of system properties, but only the system_server
-            // and system apps are allowed to set them.
-            //
-            // NOTE: Most changes made here will need an equivalent change to
-            // core/jni/AndroidRuntime.cpp
-            if (!SystemProperties.get("persist.sys.language").isEmpty()) {
-                final String languageTag = Locale.getDefault().toLanguageTag();
-
-                SystemProperties.set("persist.sys.locale", languageTag);
-                SystemProperties.set("persist.sys.language", "");
-                SystemProperties.set("persist.sys.country", "");
-                SystemProperties.set("persist.sys.localevar", "");
-            }
+            // ...
 
             // The system server should never make non-oneway calls
             Binder.setWarnOnBlocking(true);
@@ -533,25 +499,7 @@ SystemServer在/home/chan/Documents/aosp/frameworks/base/services/java/com/andro
             // Deactivate SQLiteCompatibilityWalFlags until settings provider is initialized
             SQLiteCompatibilityWalFlags.init(null);
 
-            // Here we go!
-            Slog.i(TAG, "Entered the Android system server!");
-            final long uptimeMillis = SystemClock.elapsedRealtime();
-            EventLog.writeEvent(EventLogTags.BOOT_PROGRESS_SYSTEM_RUN, uptimeMillis);
-            if (!mRuntimeRestart) {
-                FrameworkStatsLog.write(FrameworkStatsLog.BOOT_TIME_EVENT_ELAPSED_TIME_REPORTED,
-                        FrameworkStatsLog
-                                .BOOT_TIME_EVENT_ELAPSED_TIME__EVENT__SYSTEM_SERVER_INIT_START,
-                        uptimeMillis);
-            }
-
-            // In case the runtime switched since last boot (such as when
-            // the old runtime was removed in an OTA), set the system
-            // property so that it is in sync. We can't do this in
-            // libnativehelper's JniInvocation::Init code where we already
-            // had to fallback to a different runtime because it is
-            // running as root and we need to be the system user to set
-            // the property. http://b/11463182
-            SystemProperties.set("persist.sys.dalvik.vm.lib.2", VMRuntime.getRuntime().vmLibrary());
+            // ...
 
             // Mmmmmm... more memory!
             VMRuntime.getRuntime().clearGrowthLimit();
@@ -615,24 +563,7 @@ SystemServer在/home/chan/Documents/aosp/frameworks/base/services/java/com/andro
             LocalServices.addService(SystemServiceManager.class, mSystemServiceManager);
             // Prepare the thread pool for init tasks that can be parallelized
             SystemServerInitThreadPool.start();
-            // Attach JVMTI agent if this is a debuggable build and the system property is set.
-            if (Build.IS_DEBUGGABLE) {
-                // Property is of the form "library_path=parameters".
-                String jvmtiAgent = SystemProperties.get("persist.sys.dalvik.jvmtiagent");
-                if (!jvmtiAgent.isEmpty()) {
-                    int equalIndex = jvmtiAgent.indexOf('=');
-                    String libraryPath = jvmtiAgent.substring(0, equalIndex);
-                    String parameterList =
-                            jvmtiAgent.substring(equalIndex + 1, jvmtiAgent.length());
-                    // Attach the agent.
-                    try {
-                        Debug.attachJvmtiAgent(libraryPath, parameterList, null);
-                    } catch (Exception e) {
-                        Slog.e("System", "*************************************************");
-                        Slog.e("System", "********** Failed to load jvmti plugin: " + jvmtiAgent);
-                    }
-                }
-            }
+            // ...
         } finally {
             t.traceEnd();  // InitBeforeStartServices
         }
@@ -671,6 +602,97 @@ SystemServer在/home/chan/Documents/aosp/frameworks/base/services/java/com/andro
         // Loop forever.
         Looper.loop();
         throw new RuntimeException("Main thread loop unexpectedly exited");
+    }
+```
+
+这个方法做了一堆非常复杂的初始化工作，最后其实是这三个函数最为关键
+
+```java
+startBootstrapServices(t);
+startCoreServices(t);
+startOtherServices(t);
+```
+
+启动bootstrap服务
+
+```java
+    private void startBootstrapServices(@NonNull TimingsTraceAndSlog t) {
+        // ...
+        // Activity manager runs the show.
+        t.traceBegin("StartActivityManager");
+        // TODO: Might need to move after migration to WM.
+        ActivityTaskManagerService atm = mSystemServiceManager.startService(
+                ActivityTaskManagerService.Lifecycle.class).getService();
+        mActivityManagerService = ActivityManagerService.Lifecycle.startService(
+                mSystemServiceManager, atm);
+        mActivityManagerService.setSystemServiceManager(mSystemServiceManager);
+        mActivityManagerService.setInstaller(installer);
+        mWindowManagerGlobalLock = atm.getGlobalLock();
+        t.traceEnd();
+
+        // ...
+
+        t.traceBegin("StartPackageManagerService");
+        try {
+            Watchdog.getInstance().pauseWatchingCurrentThread("packagemanagermain");
+            mPackageManagerService = PackageManagerService.main(mSystemContext, installer,
+                    mFactoryTestMode != FactoryTest.FACTORY_TEST_OFF, mOnlyCore);
+        } finally {
+            Watchdog.getInstance().resumeWatchingCurrentThread("packagemanagermain");
+        }
+
+        // ...
+    }
+```
+
+这个函数非常复杂，我们常听到的AMS就是在这个函数里面初始化的。
+
+```java
+    private void startCoreServices(@NonNull TimingsTraceAndSlog t) {
+        // ...
+        // Serivce for GPU and GPU driver.
+        t.traceBegin("GpuService");
+        mSystemServiceManager.startService(GpuService.class);
+        t.traceEnd();
+
+        t.traceEnd(); // startCoreServices
+    }
+```
+
+```java
+    /**
+     * Starts a miscellaneous grab bag of stuff that has yet to be refactored and organized.
+     */
+    private void startOtherServices(@NonNull TimingsTraceAndSlog t) {
+        // ...
+            t.traceBegin("StartAlarmManagerService");
+            mSystemServiceManager.startService(new AlarmManagerService(context));
+            t.traceEnd();
+
+            t.traceBegin("StartInputManagerService");
+            inputManager = new InputManagerService(context);
+            t.traceEnd();
+
+            t.traceBegin("StartWindowManagerService");
+            // WMS needs sensor service ready
+            ConcurrentUtils.waitForFutureNoInterrupt(mSensorServiceStart, START_SENSOR_SERVICE);
+            mSensorServiceStart = null;
+            wm = WindowManagerService.main(context, inputManager, !mFirstBoot, mOnlyCore,
+                    new PhoneWindowManager(), mActivityManagerService.mActivityTaskManager);
+            ServiceManager.addService(Context.WINDOW_SERVICE, wm, /* allowIsolated= */ false,
+                    DUMP_FLAG_PRIORITY_CRITICAL | DUMP_FLAG_PROTO);
+            ServiceManager.addService(Context.INPUT_SERVICE, inputManager,
+                    /* allowIsolated= */ false, DUMP_FLAG_PRIORITY_CRITICAL);
+            t.traceEnd();
+
+            t.traceBegin("SetWindowManagerService");
+            mActivityManagerService.setWindowManager(wm);
+            t.traceEnd();
+
+            t.traceBegin("WindowManagerServiceOnInitReady");
+            wm.onInitReady();
+            t.traceEnd();
+        // ...
     }
 ```
 
