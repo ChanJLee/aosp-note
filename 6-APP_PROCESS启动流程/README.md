@@ -699,7 +699,8 @@ startOtherServices(t);
 caller = zygoteServer.runSelectLoop(abiList);
 ```
 
-runSelectLoop在ZygoteServer中定义
+runSelectLoop在ZygoteServer中定义, 主zygote进程会在创建的时候创建一个socket server，子的zygote进程在fork后会通过socket得知自己fork后的pid号，这个后面在分析android应用启动的时
+侯会用到。先占坑
 
 ```java
   Runnable runSelectLoop(String abiList) {
@@ -883,3 +884,55 @@ runSelectLoop在ZygoteServer中定义
 ```
 
 # application模式启动流程application
+
+运行一个普通java程序是在frameworks/base/core/java/com/android/internal/os/RuntimeInit.java中完成的，我们查看它的main函数
+
+```java
+    public static final void main(String[] argv) {
+        preForkInit();
+        if (argv.length == 2 && argv[1].equals("application")) {
+            if (DEBUG) Slog.d(TAG, "RuntimeInit: Starting application");
+            redirectLogStreams();
+        } else {
+            if (DEBUG) Slog.d(TAG, "RuntimeInit: Starting tool");
+        }
+
+        commonInit();
+
+        /*
+         * Now that we're running in interpreted code, call back into native code
+         * to run the system.
+         */
+        nativeFinishInit();
+
+        if (DEBUG) Slog.d(TAG, "Leaving RuntimeInit!");
+    }
+```
+
+核心在nativeFinishInit函数 它的定义在 frameworks/base/core/jni/AndroidRuntime.cpp
+
+```cpp
+static void com_android_internal_os_RuntimeInit_nativeFinishInit(JNIEnv* env, jobject clazz)
+{
+    gCurRuntime->onStarted();
+}
+```
+
+就是调用AndroidRuntime的onStart函数
+
+```cpp
+    virtual void onStarted()
+    {
+        sp<ProcessState> proc = ProcessState::self();
+        ALOGV("App process: starting thread pool.\n");
+        proc->startThreadPool();
+
+        AndroidRuntime* ar = AndroidRuntime::getRuntime();
+        ar->callMain(mClassName, mClass, mArgs);
+
+        IPCThreadState::self()->stopProcess();
+        hardware::IPCThreadState::self()->stopProcess();
+    }
+```
+
+自然而然的就调用了指定类的main函数
