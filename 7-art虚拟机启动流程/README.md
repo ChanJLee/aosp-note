@@ -260,52 +260,11 @@ bool Runtime::Create(const RuntimeOptions& raw_options, bool ignore_unrecognized
 首先它防止了重复创建，然后new一个Runtime设置到instance_里。再调用Init函数进行初始化。
 ```cpp
 bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
-  // (b/30160149): protect subprocesses from modifications to LD_LIBRARY_PATH, etc.
-  // Take a snapshot of the environment at the time the runtime was created, for use by Exec, etc.
-  env_snapshot_.TakeSnapshot();
-
-  using Opt = RuntimeArgumentMap;
-  Opt runtime_options(std::move(runtime_options_in));
-  ScopedTrace trace(__FUNCTION__);
-  CHECK_EQ(static_cast<size_t>(sysconf(_SC_PAGE_SIZE)), kPageSize);
-
-  // Early override for logging output.
-  if (runtime_options.Exists(Opt::UseStderrLogger)) {
-    android::base::SetLogger(android::base::StderrLogger);
-  }
+  //...
 
   MemMap::Init();
 
-  verifier_missing_kthrow_fatal_ = runtime_options.GetOrDefault(Opt::VerifierMissingKThrowFatal);
-  perfetto_hprof_enabled_ = runtime_options.GetOrDefault(Opt::PerfettoHprof);
-
-  // Try to reserve a dedicated fault page. This is allocated for clobbered registers and sentinels.
-  // If we cannot reserve it, log a warning.
-  // Note: We allocate this first to have a good chance of grabbing the page. The address (0xebad..)
-  //       is out-of-the-way enough that it should not collide with boot image mapping.
-  // Note: Don't request an error message. That will lead to a maps dump in the case of failure,
-  //       leading to logspam.
-  {
-    constexpr uintptr_t kSentinelAddr =
-        RoundDown(static_cast<uintptr_t>(Context::kBadGprBase), kPageSize);
-    protected_fault_page_ = MemMap::MapAnonymous("Sentinel fault page",
-                                                 reinterpret_cast<uint8_t*>(kSentinelAddr),
-                                                 kPageSize,
-                                                 PROT_NONE,
-                                                 /*low_4gb=*/ true,
-                                                 /*reuse=*/ false,
-                                                 /*reservation=*/ nullptr,
-                                                 /*error_msg=*/ nullptr);
-    if (!protected_fault_page_.IsValid()) {
-      LOG(WARNING) << "Could not reserve sentinel fault page";
-    } else if (reinterpret_cast<uintptr_t>(protected_fault_page_.Begin()) != kSentinelAddr) {
-      LOG(WARNING) << "Could not reserve sentinel fault page at the right address.";
-      protected_fault_page_.Reset();
-    }
-  }
-
-  VLOG(startup) << "Runtime::Init -verbose:startup enabled";
-
+  // ...
   QuasiAtomic::Startup();
 
   oat_file_manager_ = new OatFileManager;
@@ -354,46 +313,8 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
     }
   }
 
-  class_path_string_ = runtime_options.ReleaseOrDefault(Opt::ClassPath);
-  properties_ = runtime_options.ReleaseOrDefault(Opt::PropertiesList);
-
-  compiler_callbacks_ = runtime_options.GetOrDefault(Opt::CompilerCallbacksPtr);
-  must_relocate_ = runtime_options.GetOrDefault(Opt::Relocate);
-  is_zygote_ = runtime_options.Exists(Opt::Zygote);
-  is_primary_zygote_ = runtime_options.Exists(Opt::PrimaryZygote);
-  is_explicit_gc_disabled_ = runtime_options.Exists(Opt::DisableExplicitGC);
-  image_dex2oat_enabled_ = runtime_options.GetOrDefault(Opt::ImageDex2Oat);
-  dump_native_stack_on_sig_quit_ = runtime_options.GetOrDefault(Opt::DumpNativeStackOnSigQuit);
-
-  vfprintf_ = runtime_options.GetOrDefault(Opt::HookVfprintf);
-  exit_ = runtime_options.GetOrDefault(Opt::HookExit);
-  abort_ = runtime_options.GetOrDefault(Opt::HookAbort);
-
-  default_stack_size_ = runtime_options.GetOrDefault(Opt::StackSize);
-
-  compiler_executable_ = runtime_options.ReleaseOrDefault(Opt::Compiler);
-  compiler_options_ = runtime_options.ReleaseOrDefault(Opt::CompilerOptions);
-  for (const std::string& option : Runtime::Current()->GetCompilerOptions()) {
-    if (option == "--debuggable") {
-      SetJavaDebuggable(true);
-      break;
-    }
-  }
-  image_compiler_options_ = runtime_options.ReleaseOrDefault(Opt::ImageCompilerOptions);
-
-  finalizer_timeout_ms_ = runtime_options.GetOrDefault(Opt::FinalizerTimeoutMs);
-  max_spins_before_thin_lock_inflation_ =
-      runtime_options.GetOrDefault(Opt::MaxSpinsBeforeThinLockInflation);
-
-  monitor_list_ = new MonitorList;
-  monitor_pool_ = MonitorPool::Create();
-  thread_list_ = new ThreadList(runtime_options.GetOrDefault(Opt::ThreadSuspendTimeout));
-  intern_table_ = new InternTable;
-
-  verify_ = runtime_options.GetOrDefault(Opt::Verify);
-
-  target_sdk_version_ = runtime_options.GetOrDefault(Opt::TargetSdkVersion);
-
+  //...
+  
   // Set hidden API enforcement policy. The checks are disabled by default and
   // we only enable them if:
   // (a) runtime was started with a command line flag that enables the checks, or
