@@ -265,112 +265,6 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
   MemMap::Init();
 
   // ...
-  QuasiAtomic::Startup();
-
-  oat_file_manager_ = new OatFileManager;
-
-  jni_id_manager_.reset(new jni::JniIdManager);
-
-  Thread::SetSensitiveThreadHook(runtime_options.GetOrDefault(Opt::HookIsSensitiveThread));
-  Monitor::Init(runtime_options.GetOrDefault(Opt::LockProfThreshold),
-                runtime_options.GetOrDefault(Opt::StackDumpLockProfThreshold));
-
-  image_location_ = runtime_options.GetOrDefault(Opt::Image);
-
-  SetInstructionSet(runtime_options.GetOrDefault(Opt::ImageInstructionSet));
-  boot_class_path_ = runtime_options.ReleaseOrDefault(Opt::BootClassPath);
-  boot_class_path_locations_ = runtime_options.ReleaseOrDefault(Opt::BootClassPathLocations);
-  DCHECK(boot_class_path_locations_.empty() ||
-         boot_class_path_locations_.size() == boot_class_path_.size());
-  if (boot_class_path_.empty()) {
-    // Try to extract the boot class path from the system boot image.
-    if (image_location_.empty()) {
-      LOG(ERROR) << "Empty boot class path, cannot continue without image.";
-      return false;
-    }
-    std::string system_oat_filename = ImageHeader::GetOatLocationFromImageLocation(
-        GetSystemImageFilename(image_location_.c_str(), instruction_set_));
-    std::string system_oat_location = ImageHeader::GetOatLocationFromImageLocation(image_location_);
-    std::string error_msg;
-    std::unique_ptr<OatFile> oat_file(OatFile::Open(/*zip_fd=*/ -1,
-                                                    system_oat_filename,
-                                                    system_oat_location,
-                                                    /*executable=*/ false,
-                                                    /*low_4gb=*/ false,
-                                                    &error_msg));
-    if (oat_file == nullptr) {
-      LOG(ERROR) << "Could not open boot oat file for extracting boot class path: " << error_msg;
-      return false;
-    }
-    const OatHeader& oat_header = oat_file->GetOatHeader();
-    const char* oat_boot_class_path = oat_header.GetStoreValueByKey(OatHeader::kBootClassPathKey);
-    if (oat_boot_class_path != nullptr) {
-      Split(oat_boot_class_path, ':', &boot_class_path_);
-    }
-    if (boot_class_path_.empty()) {
-      LOG(ERROR) << "Boot class path missing from boot image oat file " << oat_file->GetLocation();
-      return false;
-    }
-  }
-
-  //...
-  
-  // Set hidden API enforcement policy. The checks are disabled by default and
-  // we only enable them if:
-  // (a) runtime was started with a command line flag that enables the checks, or
-  // (b) Zygote forked a new process that is not exempt (see ZygoteHooks).
-  hidden_api_policy_ = runtime_options.GetOrDefault(Opt::HiddenApiPolicy);
-  DCHECK(!is_zygote_ || hidden_api_policy_ == hiddenapi::EnforcementPolicy::kDisabled);
-
-  // Set core platform API enforcement policy. The checks are disabled by default and
-  // can be enabled with a command line flag. AndroidRuntime will pass the flag if
-  // a system property is set.
-  core_platform_api_policy_ = runtime_options.GetOrDefault(Opt::CorePlatformApiPolicy);
-  if (core_platform_api_policy_ != hiddenapi::EnforcementPolicy::kDisabled) {
-    LOG(INFO) << "Core platform API reporting enabled, enforcing="
-        << (core_platform_api_policy_ == hiddenapi::EnforcementPolicy::kEnabled ? "true" : "false");
-  }
-
-  no_sig_chain_ = runtime_options.Exists(Opt::NoSigChain);
-  force_native_bridge_ = runtime_options.Exists(Opt::ForceNativeBridge);
-
-  Split(runtime_options.GetOrDefault(Opt::CpuAbiList), ',', &cpu_abilist_);
-
-  fingerprint_ = runtime_options.ReleaseOrDefault(Opt::Fingerprint);
-
-  if (runtime_options.GetOrDefault(Opt::Interpret)) {
-    GetInstrumentation()->ForceInterpretOnly();
-  }
-
-  zygote_max_failed_boots_ = runtime_options.GetOrDefault(Opt::ZygoteMaxFailedBoots);
-  experimental_flags_ = runtime_options.GetOrDefault(Opt::Experimental);
-  is_low_memory_mode_ = runtime_options.Exists(Opt::LowMemoryMode);
-  madvise_random_access_ = runtime_options.GetOrDefault(Opt::MadviseRandomAccess);
-
-  jni_ids_indirection_ = runtime_options.GetOrDefault(Opt::OpaqueJniIds);
-  automatically_set_jni_ids_indirection_ =
-      runtime_options.GetOrDefault(Opt::AutoPromoteOpaqueJniIds);
-
-  plugins_ = runtime_options.ReleaseOrDefault(Opt::Plugins);
-  agent_specs_ = runtime_options.ReleaseOrDefault(Opt::AgentPath);
-  // TODO Add back in -agentlib
-  // for (auto lib : runtime_options.ReleaseOrDefault(Opt::AgentLib)) {
-  //   agents_.push_back(lib);
-  // }
-
-  float foreground_heap_growth_multiplier;
-  if (is_low_memory_mode_ && !runtime_options.Exists(Opt::ForegroundHeapGrowthMultiplier)) {
-    // If low memory mode, use 1.0 as the multiplier by default.
-    foreground_heap_growth_multiplier = 1.0f;
-  } else {
-    foreground_heap_growth_multiplier =
-        runtime_options.GetOrDefault(Opt::ForegroundHeapGrowthMultiplier) +
-            kExtraDefaultHeapGrowthMultiplier;
-  }
-  XGcOption xgc_option = runtime_options.GetOrDefault(Opt::GcOption);
-
-  // Generational CC collection is currently only compatible with Baker read barriers.
-  bool use_generational_cc = kUseBakerReadBarrier && xgc_option.generational_cc;
 
   heap_ = new gc::Heap(runtime_options.GetOrDefault(Opt::MemoryInitialSize),
                        runtime_options.GetOrDefault(Opt::HeapGrowthLimit),
@@ -413,113 +307,8 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
                        runtime_options.Exists(Opt::DumpRegionInfoBeforeGC),
                        runtime_options.Exists(Opt::DumpRegionInfoAfterGC));
 
-  dump_gc_performance_on_shutdown_ = runtime_options.Exists(Opt::DumpGCPerformanceOnShutdown);
-
-  jdwp_options_ = runtime_options.GetOrDefault(Opt::JdwpOptions);
-  jdwp_provider_ = CanonicalizeJdwpProvider(runtime_options.GetOrDefault(Opt::JdwpProvider),
-                                            IsJavaDebuggable());
-  switch (jdwp_provider_) {
-    case JdwpProvider::kNone: {
-      VLOG(jdwp) << "Disabling all JDWP support.";
-      if (!jdwp_options_.empty()) {
-        bool has_transport = jdwp_options_.find("transport") != std::string::npos;
-        std::string adb_connection_args =
-            std::string("  -XjdwpProvider:adbconnection -XjdwpOptions:") + jdwp_options_;
-        LOG(WARNING) << "Jdwp options given when jdwp is disabled! You probably want to enable "
-                     << "jdwp with one of:" << std::endl
-                     << "  -Xplugin:libopenjdkjvmti" << (kIsDebugBuild ? "d" : "") << ".so "
-                     << "-agentpath:libjdwp.so=" << jdwp_options_ << std::endl
-                     << (has_transport ? "" : adb_connection_args);
-      }
-      break;
-    }
-    case JdwpProvider::kAdbConnection: {
-      constexpr const char* plugin_name = kIsDebugBuild ? "libadbconnectiond.so"
-                                                        : "libadbconnection.so";
-      plugins_.push_back(Plugin::Create(plugin_name));
-      break;
-    }
-    case JdwpProvider::kUnset: {
-      LOG(FATAL) << "Illegal jdwp provider " << jdwp_provider_ << " was not filtered out!";
-    }
-  }
-  callbacks_->AddThreadLifecycleCallback(Dbg::GetThreadLifecycleCallback());
-
-  jit_options_.reset(jit::JitOptions::CreateFromRuntimeArguments(runtime_options));
-  if (IsAotCompiler()) {
-    // If we are already the compiler at this point, we must be dex2oat. Don't create the jit in
-    // this case.
-    // If runtime_options doesn't have UseJIT set to true then CreateFromRuntimeArguments returns
-    // null and we don't create the jit.
-    jit_options_->SetUseJitCompilation(false);
-    jit_options_->SetSaveProfilingInfo(false);
-  }
-
-  // Use MemMap arena pool for jit, malloc otherwise. Malloc arenas are faster to allocate but
-  // can't be trimmed as easily.
-  const bool use_malloc = IsAotCompiler();
-  if (use_malloc) {
-    arena_pool_.reset(new MallocArenaPool());
-    jit_arena_pool_.reset(new MallocArenaPool());
-  } else {
-    arena_pool_.reset(new MemMapArenaPool(/* low_4gb= */ false));
-    jit_arena_pool_.reset(new MemMapArenaPool(/* low_4gb= */ false, "CompilerMetadata"));
-  }
-
-  if (IsAotCompiler() && Is64BitInstructionSet(kRuntimeISA)) {
-    // 4gb, no malloc. Explanation in header.
-    low_4gb_arena_pool_.reset(new MemMapArenaPool(/* low_4gb= */ true));
-  }
-  linear_alloc_.reset(CreateLinearAlloc());
-
-  BlockSignals();
-  InitPlatformSignalHandlers();
-
-  // Change the implicit checks flags based on runtime architecture.
-  switch (kRuntimeISA) {
-    case InstructionSet::kArm:
-    case InstructionSet::kThumb2:
-    case InstructionSet::kX86:
-    case InstructionSet::kArm64:
-    case InstructionSet::kX86_64:
-      implicit_null_checks_ = true;
-      // Historical note: Installing stack protection was not playing well with Valgrind.
-      implicit_so_checks_ = true;
-      break;
-    default:
-      // Keep the defaults.
-      break;
-  }
-
-  if (!no_sig_chain_) {
-    // Dex2Oat's Runtime does not need the signal chain or the fault handler.
-    if (implicit_null_checks_ || implicit_so_checks_ || implicit_suspend_checks_) {
-      fault_manager.Init();
-
-      // These need to be in a specific order.  The null point check handler must be
-      // after the suspend check and stack overflow check handlers.
-      //
-      // Note: the instances attach themselves to the fault manager and are handled by it. The
-      //       manager will delete the instance on Shutdown().
-      if (implicit_suspend_checks_) {
-        new SuspensionHandler(&fault_manager);
-      }
-
-      if (implicit_so_checks_) {
-        new StackOverflowHandler(&fault_manager);
-      }
-
-      if (implicit_null_checks_) {
-        new NullPointerHandler(&fault_manager);
-      }
-
-      if (kEnableJavaStackTraceHandler) {
-        new JavaStackTraceHandler(&fault_manager);
-      }
-    }
-  }
-
-  verifier_logging_threshold_ms_ = runtime_options.GetOrDefault(Opt::VerifierLoggingThreshold);
+ 
+  // ...
 
   std::string error_msg;
   java_vm_ = JavaVMExt::Create(this, runtime_options, &error_msg);
@@ -528,9 +317,7 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
     return false;
   }
 
-  // Add the JniEnv handler.
-  // TODO Refactor this stuff.
-  java_vm_->AddEnvironmentHook(JNIEnvExt::GetEnvHandler);
+  //...
 
   Thread::Startup();
 
@@ -546,10 +333,7 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
   // Set us to runnable so tools using a runtime can allocate and GC by default
   self->TransitionFromSuspendedToRunnable();
 
-  // Now we're attached, we can take the heap locks and validate the heap.
-  GetHeap()->EnableObjectValidation();
-
-  CHECK_GE(GetHeap()->GetContinuousSpaces().size(), 1U);
+  // ...
 
   if (UNLIKELY(IsAotCompiler())) {
     class_linker_ = new AotClassLinker(intern_table_);
@@ -559,44 +343,7 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
         runtime_options.GetOrDefault(Opt::FastClassNotFoundException));
   }
   if (GetHeap()->HasBootImageSpace()) {
-    bool result = class_linker_->InitFromBootImage(&error_msg);
-    if (!result) {
-      LOG(ERROR) << "Could not initialize from image: " << error_msg;
-      return false;
-    }
-    if (kIsDebugBuild) {
-      for (auto image_space : GetHeap()->GetBootImageSpaces()) {
-        image_space->VerifyImageAllocations();
-      }
-    }
-    {
-      ScopedTrace trace2("AddImageStringsToTable");
-      for (gc::space::ImageSpace* image_space : heap_->GetBootImageSpaces()) {
-        GetInternTable()->AddImageStringsToTable(image_space, VoidFunctor());
-      }
-    }
-    if (heap_->GetBootImageSpaces().size() != GetBootClassPath().size()) {
-      // The boot image did not contain all boot class path components. Load the rest.
-      DCHECK_LT(heap_->GetBootImageSpaces().size(), GetBootClassPath().size());
-      size_t start = heap_->GetBootImageSpaces().size();
-      DCHECK_LT(start, GetBootClassPath().size());
-      std::vector<std::unique_ptr<const DexFile>> extra_boot_class_path;
-      if (runtime_options.Exists(Opt::BootClassPathDexList)) {
-        extra_boot_class_path.swap(*runtime_options.GetOrDefault(Opt::BootClassPathDexList));
-      } else {
-        OpenBootDexFiles(ArrayRef<const std::string>(GetBootClassPath()).SubArray(start),
-                         ArrayRef<const std::string>(GetBootClassPathLocations()).SubArray(start),
-                         &extra_boot_class_path);
-      }
-      class_linker_->AddExtraBootDexFiles(self, std::move(extra_boot_class_path));
-    }
-    if (IsJavaDebuggable() || jit_options_->GetProfileSaverOptions().GetProfileBootClassPath()) {
-      // Deoptimize the boot image if debuggable  as the code may have been compiled non-debuggable.
-      // Also deoptimize if we are profiling the boot class path.
-      ScopedThreadSuspension sts(self, ThreadState::kNative);
-      ScopedSuspendAll ssa(__FUNCTION__);
-      DeoptimizeBootImage();
-    }
+    // ...
   } else {
     std::vector<std::unique_ptr<const DexFile>> boot_class_path;
     if (runtime_options.Exists(Opt::BootClassPathDexList)) {
@@ -624,19 +371,7 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
   CHECK(class_linker_ != nullptr);
 
   verifier::ClassVerifier::Init(class_linker_);
-
-  if (runtime_options.Exists(Opt::MethodTrace)) {
-    trace_config_.reset(new TraceConfig());
-    trace_config_->trace_file = runtime_options.ReleaseOrDefault(Opt::MethodTraceFile);
-    trace_config_->trace_file_size = runtime_options.ReleaseOrDefault(Opt::MethodTraceFileSize);
-    trace_config_->trace_mode = Trace::TraceMode::kMethodTracing;
-    trace_config_->trace_output_mode = runtime_options.Exists(Opt::MethodTraceStreaming) ?
-        Trace::TraceOutputMode::kStreaming :
-        Trace::TraceOutputMode::kFile;
-  }
-
-  // TODO: move this to just be an Trace::Start argument
-  Trace::SetDefaultClockSource(runtime_options.GetOrDefault(Opt::ProfileClock));
+  // ...
 
   if (GetHeap()->HasBootImageSpace()) {
     const ImageHeader& image_header = GetHeap()->GetBootImageSpaces()[0]->GetImageHeader();
@@ -660,138 +395,29 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
     DCHECK(pre_allocated_NoClassDefFoundError_.Read()->GetClass()
                ->DescriptorEquals("Ljava/lang/NoClassDefFoundError;"));
   } else {
-    // Pre-allocate an OutOfMemoryError for the case when we fail to
-    // allocate the exception to be thrown.
-    CreatePreAllocatedException(self,
-                                this,
-                                &pre_allocated_OutOfMemoryError_when_throwing_exception_,
-                                "Ljava/lang/OutOfMemoryError;",
-                                "OutOfMemoryError thrown while trying to throw an exception; "
-                                    "no stack trace available");
-    // Pre-allocate an OutOfMemoryError for the double-OOME case.
-    CreatePreAllocatedException(self,
-                                this,
-                                &pre_allocated_OutOfMemoryError_when_throwing_oome_,
-                                "Ljava/lang/OutOfMemoryError;",
-                                "OutOfMemoryError thrown while trying to throw OutOfMemoryError; "
-                                    "no stack trace available");
-    // Pre-allocate an OutOfMemoryError for the case when we fail to
-    // allocate while handling a stack overflow.
-    CreatePreAllocatedException(self,
-                                this,
-                                &pre_allocated_OutOfMemoryError_when_handling_stack_overflow_,
-                                "Ljava/lang/OutOfMemoryError;",
-                                "OutOfMemoryError thrown while trying to handle a stack overflow; "
-                                    "no stack trace available");
-
-    // Pre-allocate a NoClassDefFoundError for the common case of failing to find a system class
-    // ahead of checking the application's class loader.
-    CreatePreAllocatedException(self,
-                                this,
-                                &pre_allocated_NoClassDefFoundError_,
-                                "Ljava/lang/NoClassDefFoundError;",
-                                "Class not found using the boot class loader; "
-                                    "no stack trace available");
+    // ...
   }
 
   // Class-roots are setup, we can now finish initializing the JniIdManager.
   GetJniIdManager()->Init(self);
 
-  // Runtime initialization is largely done now.
-  // We load plugins first since that can modify the runtime state slightly.
-  // Load all plugins
-  {
-    // The init method of plugins expect the state of the thread to be non runnable.
-    ScopedThreadSuspension sts(self, ThreadState::kNative);
-    for (auto& plugin : plugins_) {
-      std::string err;
-      if (!plugin.Load(&err)) {
-        LOG(FATAL) << plugin << " failed to load: " << err;
-      }
-    }
-  }
-
-  // Look for a native bridge.
-  //
-  // The intended flow here is, in the case of a running system:
-  //
-  // Runtime::Init() (zygote):
-  //   LoadNativeBridge -> dlopen from cmd line parameter.
-  //  |
-  //  V
-  // Runtime::Start() (zygote):
-  //   No-op wrt native bridge.
-  //  |
-  //  | start app
-  //  V
-  // DidForkFromZygote(action)
-  //   action = kUnload -> dlclose native bridge.
-  //   action = kInitialize -> initialize library
-  //
-  //
-  // The intended flow here is, in the case of a simple dalvikvm call:
-  //
-  // Runtime::Init():
-  //   LoadNativeBridge -> dlopen from cmd line parameter.
-  //  |
-  //  V
-  // Runtime::Start():
-  //   DidForkFromZygote(kInitialize) -> try to initialize any native bridge given.
-  //   No-op wrt native bridge.
-  {
-    std::string native_bridge_file_name = runtime_options.ReleaseOrDefault(Opt::NativeBridge);
-    is_native_bridge_loaded_ = LoadNativeBridge(native_bridge_file_name);
-  }
-
-  // Startup agents
-  // TODO Maybe we should start a new thread to run these on. Investigate RI behavior more.
-  for (auto& agent_spec : agent_specs_) {
-    // TODO Check err
-    int res = 0;
-    std::string err = "";
-    ti::LoadError error;
-    std::unique_ptr<ti::Agent> agent = agent_spec.Load(&res, &error, &err);
-
-    if (agent != nullptr) {
-      agents_.push_back(std::move(agent));
-      continue;
-    }
-
-    switch (error) {
-      case ti::LoadError::kInitializationError:
-        LOG(FATAL) << "Unable to initialize agent!";
-        UNREACHABLE();
-
-      case ti::LoadError::kLoadingError:
-        LOG(ERROR) << "Unable to load an agent: " << err;
-        continue;
-
-      case ti::LoadError::kNoError:
-        break;
-    }
-    LOG(FATAL) << "Unreachable";
-    UNREACHABLE();
-  }
-  {
-    ScopedObjectAccess soa(self);
-    callbacks_->NextRuntimePhase(RuntimePhaseCallback::RuntimePhase::kInitialAgents);
-  }
-
-  if (IsZygote() && IsPerfettoHprofEnabled()) {
-    constexpr const char* plugin_name = kIsDebugBuild ?
-        "libperfetto_hprofd.so" : "libperfetto_hprof.so";
-    // Load eagerly in Zygote to improve app startup times. This will make
-    // subsequent dlopens for the library no-ops.
-    dlopen(plugin_name, RTLD_NOW | RTLD_LOCAL);
-  }
-
-  VLOG(startup) << "Runtime::Init exiting";
-
-  // Set OnlyUseSystemOatFiles only after boot classpath has been set up.
-  if (runtime_options.Exists(Opt::OnlyUseSystemOatFiles)) {
-    oat_file_manager_->SetOnlyUseSystemOatFiles();
-  }
-
+  // ...
   return true;
 }
 ```
+
+Init非常复杂，我能看到的有这几步
+
+1. 初始化MemMap
+
+2. 初始化GC的堆
+
+3. 调用JavaVMExt的Create函数
+
+4. 创建主线程
+
+5. 创建class linker
+
+6. 加载boot class
+
+7. 初始化主线程的jni
