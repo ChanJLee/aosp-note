@@ -421,3 +421,199 @@ Init非常复杂，我能看到的有这几步
 6. 加载boot class
 
 7. 初始化主线程的jni
+
+第一步和第二步跟GC有关，我们这次不考虑分析。
+
+
+```cpp
+std::unique_ptr<JavaVMExt> JavaVMExt::Create(Runtime* runtime,
+                                             const RuntimeArgumentMap& runtime_options,
+                                             std::string* error_msg) NO_THREAD_SAFETY_ANALYSIS {
+  std::unique_ptr<JavaVMExt> java_vm(new JavaVMExt(runtime, runtime_options, error_msg));
+  if (java_vm && java_vm->globals_.IsValid() && java_vm->weak_globals_.IsValid()) {
+    return java_vm;
+  }
+  return nullptr;
+}
+```
+
+create函数很简单，就是新建一个JavaVMExt对象。
+art/runtime/thread.cc
+
+```cpp
+Thread* Thread::Attach(const char* thread_name,
+                       bool as_daemon,
+                       jobject thread_group,
+                       bool create_peer) {
+  auto create_peer_action = [&](Thread* self) {
+    if (create_peer) {
+      // ...
+    } else {
+      // These aren't necessary, but they improve diagnostics for unit tests & command-line tools.
+      if (thread_name != nullptr) {
+        self->tlsPtr_.name->assign(thread_name);
+        ::art::SetThreadName(thread_name);
+      }
+      // ...
+    }
+    return true;
+  };
+  return Attach(thread_name, as_daemon, create_peer_action);
+}
+```
+
+线程的创建会转发给另外一个函数
+
+```cpp
+template <typename PeerAction>
+Thread* Thread::Attach(const char* thread_name, bool as_daemon, PeerAction peer_action) {
+  Runtime* runtime = Runtime::Current();
+  // ...
+  Thread* self;
+  {
+    ScopedTrace trace2("Thread birth");
+    MutexLock mu(nullptr, *Locks::runtime_shutdown_lock_);
+    if (runtime->IsShuttingDownLocked()) {
+      LOG(WARNING) << "Thread attaching while runtime is shutting down: " <<
+          ((thread_name != nullptr) ? thread_name : "(Unnamed)");
+      return nullptr;
+    } else {
+      Runtime::Current()->StartThreadBirth();
+      self = new Thread(as_daemon);
+      bool init_success = self->Init(runtime->GetThreadList(), runtime->GetJavaVM());
+      Runtime::Current()->EndThreadBirth();
+      if (!init_success) {
+        delete self;
+        return nullptr;
+      }
+    }
+  }
+
+  self->InitStringEntryPoints();
+
+  CHECK_NE(self->GetState(), kRunnable);
+  self->SetState(kNative);
+
+  // Run the action that is acting on the peer.
+  if (!peer_action(self)) {
+    runtime->GetThreadList()->Unregister(self);
+    // Unregister deletes self, no need to do this here.
+    return nullptr;
+  }
+
+  if (VLOG_IS_ON(threads)) {
+    if (thread_name != nullptr) {
+      VLOG(threads) << "Attaching thread " << thread_name;
+    } else {
+      VLOG(threads) << "Attaching unnamed thread.";
+    }
+    ScopedObjectAccess soa(self);
+    self->Dump(LOG_STREAM(INFO));
+  }
+
+  {
+    ScopedObjectAccess soa(self);
+    runtime->GetRuntimeCallbacks()->ThreadStart(self);
+  }
+
+  return self;
+}
+```
+
+Thread先是创建一个对象，这个方法比较简单，就是设置各种属性。然后调用Init函数
+
+```cpp
+
+bool Thread::Init(ThreadList* thread_list, JavaVMExt* java_vm, JNIEnvExt* jni_env_ext) {
+  // This function does all the initialization that must be run by the native thread it applies to.
+  // (When we create a new thread from managed code, we allocate the Thread* in Thread::Create so
+  // we can handshake with the corresponding native thread when it's ready.) Check this native
+  // thread hasn't been through here already...
+  CHECK(Thread::Current() == nullptr);
+
+  // Set pthread_self_ ahead of pthread_setspecific, that makes Thread::Current function, this
+  // avoids pthread_self_ ever being invalid when discovered from Thread::Current().
+  tlsPtr_.pthread_self = pthread_self();
+  CHECK(is_started_);
+
+  ScopedTrace trace("Thread::Init");
+
+  SetUpAlternateSignalStack();
+  if (!InitStackHwm()) {
+    return false;
+  }
+  InitCpu();
+  InitTlsEntryPoints();
+  RemoveSuspendTrigger();
+  InitCardTable();
+  InitTid();
+  {
+    ScopedTrace trace2("InitInterpreterTls");
+    interpreter::InitInterpreterTls(this);
+  }
+
+#ifdef __BIONIC__
+  __get_tls()[TLS_SLOT_ART_THREAD_SELF] = this;
+#else
+  CHECK_PTHREAD_CALL(pthread_setspecific, (Thread::pthread_key_self_, this), "attach self");
+  Thread::self_tls_ = this;
+#endif
+  DCHECK_EQ(Thread::Current(), this);
+
+  tls32_.thin_lock_thread_id = thread_list->AllocThreadId(this);
+
+  if (jni_env_ext != nullptr) {
+    DCHECK_EQ(jni_env_ext->GetVm(), java_vm);
+    DCHECK_EQ(jni_env_ext->GetSelf(), this);
+    tlsPtr_.jni_env = jni_env_ext;
+  } else {
+    std::string error_msg;
+    tlsPtr_.jni_env = JNIEnvExt::Create(this, java_vm, &error_msg);
+    if (tlsPtr_.jni_env == nullptr) {
+      LOG(ERROR) << "Failed to create JNIEnvExt: " << error_msg;
+      return false;
+    }
+  }
+
+  ScopedTrace trace3("ThreadList::Register");
+  thread_list->Register(this);
+  return true;
+}
+```
+
+Init函数很复杂，显示通过pthread函数创建一个线程， 然后通过pthrea提供的接口获取栈信息，最终要的是创建当前线程的jni env，然后调用
+thread_list->Register(this); 将自己添加到线程列表里。线程列表在Runtime里。
+
+创建完主线程，剩下的就是创建class linker，class linker是用来给class loader加载类用的。
+
+art/runtime/class_linker.cc
+```cpp
+ClassLinker::ClassLinker(InternTable* intern_table, bool fast_class_not_found_exceptions)
+    : boot_class_table_(new ClassTable()),
+      failed_dex_cache_class_lookups_(0),
+      class_roots_(nullptr),
+      find_array_class_cache_next_victim_(0),
+      init_done_(false),
+      log_new_roots_(false),
+      intern_table_(intern_table),
+      fast_class_not_found_exceptions_(fast_class_not_found_exceptions),
+      jni_dlsym_lookup_trampoline_(nullptr),
+      jni_dlsym_lookup_critical_trampoline_(nullptr),
+      quick_resolution_trampoline_(nullptr),
+      quick_imt_conflict_trampoline_(nullptr),
+      quick_generic_jni_trampoline_(nullptr),
+      quick_to_interpreter_bridge_trampoline_(nullptr),
+      image_pointer_size_(kRuntimePointerSize),
+      visibly_initialized_callback_lock_("visibly initialized callback lock"),
+      visibly_initialized_callback_(nullptr),
+      critical_native_code_with_clinit_check_lock_("critical native code with clinit check lock"),
+      critical_native_code_with_clinit_check_(),
+      cha_(Runtime::Current()->IsAotCompiler() ? nullptr : new ClassHierarchyAnalysis()) {
+  // For CHA disabled during Aot, see b/34193647.
+
+  CHECK(intern_table_ != nullptr);
+  static_assert(kFindArrayCacheSize == arraysize(find_array_class_cache_),
+                "Array cache size wrong.");
+  std::fill_n(find_array_class_cache_, kFindArrayCacheSize, GcRoot<mirror::Class>(nullptr));
+}
+```
