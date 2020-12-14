@@ -498,10 +498,7 @@ bool ClassLoaderContext::CreateInfoFromClassLoader(
       ClassLoaderInfo* child_info,
       bool is_shared_library)
     REQUIRES_SHARED(Locks::mutator_lock_) {
-  if (ClassLinker::IsBootClassLoader(soa, class_loader.Get())) {
-    // Nothing to do for the boot class loader as we don't add its dex files to the context.
-    return true;
-  }
+  // ...
 
   ClassLoaderContext::ClassLoaderType type;
   if (IsPathOrDexClassLoader(soa, class_loader)) {
@@ -585,3 +582,17 @@ bool ClassLoaderContext::CreateInfoFromClassLoader(
   return true;
 }
 ```
+
+CreateInfoFromClassLoader函数首先
+
+1. 会去判断当前的class loader类型，也就是前面我们说的那几个 path/dex class loader, in memory dex class loader.
+
+2. CollectDexFilesFromSupportedClassLoader 收集已经加载过的dex file
+
+3. 收集当前 GetDexFilesFromDexElementsArray class loader里的dex file
+
+4. 将已经加载的dex file添加到class loader info里
+
+5. 递归调用至父加载器
+
+在收集到当前class loader 的 info之后 CreateContextForClassLoader 就执行结束了。函数再到OpenDexFilesFromOat中继续执行，这时候我们已经获得了class loader的info。然后创建OatFileAssistant
