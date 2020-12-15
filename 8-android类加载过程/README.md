@@ -595,4 +595,107 @@ CreateInfoFromClassLoader函数首先
 
 5. 递归调用至父加载器
 
-在收集到当前class loader 的 info之后 CreateContextForClassLoader 就执行结束了。函数再到OpenDexFilesFromOat中继续执行，这时候我们已经获得了class loader的info。然后创建OatFileAssistant
+在收集到当前class loader 的 info之后 CreateContextForClassLoader 就执行结束了。函数再到OpenDexFilesFromOat中继续执行，这时候我们已经获得了class loader的info。然后创建OatFileAssistant, OatFileAssistant能够获取到oat文件，oat就是dex被编译后的文件。
+
+当获取到oat文件后，并且class loader的上下文也拿到了，那么就去验证class loader 的上下文。验证完之后回去检查当前的oat文件是否可以执行，如果可以执行，那么就从oat文件中加载dex， 否则从image中去加载dex文件。最后如果加载dex成功了，那么就当前的dex信息注册到jit编译器中。
+
+
+我们可以看下OatFileAssistant的具体实现。
+
+art/runtime/oat_file_assistant.cc
+
+```cpp
+OatFileAssistant::OatFileAssistant(const char* dex_location,
+                                   const InstructionSet isa,
+                                   bool load_executable,
+                                   bool only_load_system_executable,
+                                   int vdex_fd,
+                                   int oat_fd,
+                                   int zip_fd)
+    : isa_(isa),
+      load_executable_(load_executable),
+      only_load_system_executable_(only_load_system_executable),
+      odex_(this, /*is_oat_location=*/ false),
+      oat_(this, /*is_oat_location=*/ true),
+      zip_fd_(zip_fd) {
+  CHECK(dex_location != nullptr) << "OatFileAssistant: null dex location";
+
+  // ...
+
+  dex_location_.assign(dex_location);
+
+  // ...
+
+  // Get the odex filename.
+  std::string error_msg;
+  std::string odex_file_name;
+  if (DexLocationToOdexFilename(dex_location_, isa_, &odex_file_name, &error_msg)) {
+    odex_.Reset(odex_file_name, UseFdToReadFiles(), zip_fd, vdex_fd, oat_fd);
+  } else {
+    LOG(WARNING) << "Failed to determine odex file name: " << error_msg;
+  }
+
+  if (!UseFdToReadFiles()) {
+    // Get the oat filename.
+    std::string oat_file_name;
+    if (DexLocationToOatFilename(dex_location_, isa_, &oat_file_name, &error_msg)) {
+      oat_.Reset(oat_file_name, /*use_fd=*/ false);
+    } else {
+      LOG(WARNING) << "Failed to determine oat file name for dex location "
+                   << dex_location_ << ": " << error_msg;
+    }
+  }
+
+  // ...
+}
+```
+
+ctor会记录下dex文件的路径，并且会推断出当前dex file的oat文件, odex文件。
+
+获取oat的函数
+
+```cpp
+std::unique_ptr<OatFile> OatFileAssistant::GetBestOatFile() {
+  return GetBestInfo().ReleaseFileForUse();
+}
+```
+
+```cpp
+OatFileAssistant::OatFileInfo& OatFileAssistant::GetBestInfo() {
+  ScopedTrace trace("GetBestInfo");
+  // TODO(calin): Document the side effects of class loading when
+  // running dalvikvm command line.
+  if (dex_parent_writable_ || UseFdToReadFiles()) {
+    // If the parent of the dex file is writable it means that we can
+    // create the odex file. In this case we unconditionally pick the odex
+    // as the best oat file. This corresponds to the regular use case when
+    // apps gets installed or when they load private, secondary dex file.
+    // For apps on the system partition the odex location will not be
+    // writable and thus the oat location might be more up to date.
+    return odex_;
+  }
+
+  // We cannot write to the odex location. This must be a system app.
+
+  // If the oat location is usable take it.
+  if (oat_.IsUseable()) {
+    return oat_;
+  }
+
+  // The oat file is not usable but the odex file might be up to date.
+  // This is an indication that we are dealing with an up to date prebuilt
+  // (that doesn't need relocation).
+  if (odex_.Status() == kOatUpToDate) {
+    return odex_;
+  }
+
+  // We got into the worst situation here:
+  // - the oat location is not usable
+  // - the prebuild odex location is not up to date
+  // - and we don't have the original dex file anymore (stripped).
+  // Pick the odex if it exists, or the oat if not.
+  return (odex_.Status() == kOatCannotOpen) ? oat_ : odex_;
+}
+```
+
+这里优先返回的是odex文件，将odex文件看作是最优的OatFile
