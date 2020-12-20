@@ -253,7 +253,7 @@ static jobject DexFile_openDexFileNative(JNIEnv* env,
 }
 ```
 
-openDexFileNative 会调用OatFIleManager的OpenDexFilesFromOat函数去打开dex file， CreateCookieFromOatFileManagerResult
+openDexFileNative 会调用OatFileManager的OpenDexFilesFromOat函数去打开dex file， CreateCookieFromOatFileManagerResult
 
 ```cpp
 std::vector<std::unique_ptr<const DexFile>> OatFileManager::OpenDexFilesFromOat(
@@ -699,3 +699,177 @@ OatFileAssistant::OatFileInfo& OatFileAssistant::GetBestInfo() {
 ```
 
 这里优先返回的是odex文件，将odex文件看作是最优的OatFile
+
+回到OpenDexFilesFromOat文件，如果返回的oat file能够执行，也就是oat文件， 那么就调用 OpenImageSpace 打开oat文件 否则 调用 LoadDexFiles 打开文件
+
+如果上面两个方法都没有成功打开dex file，还有一个fallback方案 ArtDexFileLoader 的 Open 方法
+
+打开oat文件 先找到对应文件的art文件，然后调用 gc::space::ImageSpace::CreateFromAppImage 创建 ImageSpace
+
+art/runtime/oat_file_assistant.cc
+```cpp
+std::unique_ptr<gc::space::ImageSpace> OatFileAssistant::OpenImageSpace(const OatFile* oat_file) {
+  DCHECK(oat_file != nullptr);
+  std::string art_file = ReplaceFileExtension(oat_file->GetLocation(), "art");
+  if (art_file.empty()) {
+    return nullptr;
+  }
+  std::string error_msg;
+  ScopedObjectAccess soa(Thread::Current());
+  std::unique_ptr<gc::space::ImageSpace> ret =
+      gc::space::ImageSpace::CreateFromAppImage(art_file.c_str(), oat_file, &error_msg);
+  if (ret == nullptr && (VLOG_IS_ON(image) || OS::FileExists(art_file.c_str()))) {
+    LOG(INFO) << "Failed to open app image " << art_file.c_str() << " " << error_msg;
+  }
+  return ret;
+}
+```
+
+art/runtime/gc/space/image_space.cc
+```cpp
+std::unique_ptr<ImageSpace> ImageSpace::CreateFromAppImage(const char* image,
+                                                           const OatFile* oat_file,
+                                                           std::string* error_msg) {
+  // Note: The oat file has already been validated.
+  const std::vector<ImageSpace*>& boot_image_spaces =
+      Runtime::Current()->GetHeap()->GetBootImageSpaces();
+  return CreateFromAppImage(image,
+                            oat_file,
+                            ArrayRef<ImageSpace* const>(boot_image_spaces),
+                            error_msg);
+}
+```
+
+函数只是把请求转发到了CreateFromAppImage中
+
+```cpp
+std::unique_ptr<ImageSpace> ImageSpace::CreateFromAppImage(
+    const char* image,
+    const OatFile* oat_file,
+    ArrayRef<ImageSpace* const> boot_image_spaces,
+    std::string* error_msg) {
+  return Loader::InitAppImage(image,
+                              image,
+                              oat_file,
+                              boot_image_spaces,
+                              error_msg);
+}
+```
+
+然后继续转发到InitAppImage中, 源码暂时没有跟到，看起来到了bootloader中
+
+
+```cpp
+bool OatFileAssistant::LoadDexFiles(
+    const OatFile &oat_file,
+    const std::string& dex_location,
+    std::vector<std::unique_ptr<const DexFile>>* out_dex_files) {
+  // Load the main dex file.
+  std::string error_msg;
+  const OatDexFile* oat_dex_file = oat_file.GetOatDexFile(
+      dex_location.c_str(), nullptr, &error_msg);
+  if (oat_dex_file == nullptr) {
+    LOG(WARNING) << error_msg;
+    return false;
+  }
+
+  std::unique_ptr<const DexFile> dex_file = oat_dex_file->OpenDexFile(&error_msg);
+  if (dex_file.get() == nullptr) {
+    LOG(WARNING) << "Failed to open dex file from oat dex file: " << error_msg;
+    return false;
+  }
+  out_dex_files->push_back(std::move(dex_file));
+
+  // Load the rest of the multidex entries
+  for (size_t i = 1;; i++) {
+    std::string multidex_dex_location = DexFileLoader::GetMultiDexLocation(i, dex_location.c_str());
+    oat_dex_file = oat_file.GetOatDexFile(multidex_dex_location.c_str(), nullptr);
+    if (oat_dex_file == nullptr) {
+      // There are no more multidex entries to load.
+      break;
+    }
+
+    dex_file = oat_dex_file->OpenDexFile(&error_msg);
+    if (dex_file.get() == nullptr) {
+      LOG(WARNING) << "Failed to open dex file from oat dex file: " << error_msg;
+      return false;
+    }
+    out_dex_files->push_back(std::move(dex_file));
+  }
+  return true;
+}
+```
+
+这个函数首先去拿到oat文件路径，然后打开dexfile，后面一个是处理multidex的case，先看oat文件路径怎么拿到的
+
+art/runtime/oat_file.cc
+```cpp
+const OatDexFile* OatFile::GetOatDexFile(const char* dex_location,
+                                         const uint32_t* dex_location_checksum,
+                                         std::string* error_msg) const {
+  // NOTE: We assume here that the canonical location for a given dex_location never
+  // changes. If it does (i.e. some symlink used by the filename changes) we may return
+  // an incorrect OatDexFile. As long as we have a checksum to check, we shall return
+  // an identical file or fail; otherwise we may see some unpredictable failures.
+
+  // TODO: Additional analysis of usage patterns to see if this can be simplified
+  // without any performance loss, for example by not doing the first lock-free lookup.
+
+  const OatDexFile* oat_dex_file = nullptr;
+  std::string_view key(dex_location);
+  // Try to find the key cheaply in the oat_dex_files_ map which holds dex locations
+  // directly mentioned in the oat file and doesn't require locking.
+  auto primary_it = oat_dex_files_.find(key);
+  if (primary_it != oat_dex_files_.end()) {
+    oat_dex_file = primary_it->second;
+    DCHECK(oat_dex_file != nullptr);
+  } else {
+    // This dex_location is not one of the dex locations directly mentioned in the
+    // oat file. The correct lookup is via the canonical location but first see in
+    // the secondary_oat_dex_files_ whether we've looked up this location before.
+    MutexLock mu(Thread::Current(), secondary_lookup_lock_);
+    auto secondary_lb = secondary_oat_dex_files_.lower_bound(key);
+    if (secondary_lb != secondary_oat_dex_files_.end() && key == secondary_lb->first) {
+      oat_dex_file = secondary_lb->second;  // May be null.
+    } else {
+      // We haven't seen this dex_location before, we must check the canonical location.
+      std::string dex_canonical_location = DexFileLoader::GetDexCanonicalLocation(dex_location);
+      if (dex_canonical_location != dex_location) {
+        std::string_view canonical_key(dex_canonical_location);
+        auto canonical_it = oat_dex_files_.find(canonical_key);
+        if (canonical_it != oat_dex_files_.end()) {
+          oat_dex_file = canonical_it->second;
+        }  // else keep null.
+      }  // else keep null.
+
+      // Copy the key to the string_cache_ and store the result in secondary map.
+      string_cache_.emplace_back(key.data(), key.length());
+      std::string_view key_copy(string_cache_.back());
+      secondary_oat_dex_files_.PutBefore(secondary_lb, key_copy, oat_dex_file);
+    }
+  }
+
+  if (oat_dex_file == nullptr) {
+    if (error_msg != nullptr) {
+      std::string dex_canonical_location = DexFileLoader::GetDexCanonicalLocation(dex_location);
+      *error_msg = "Failed to find OatDexFile for DexFile " + std::string(dex_location)
+          + " (canonical path " + dex_canonical_location + ") in OatFile " + GetLocation();
+    }
+    return nullptr;
+  }
+
+  if (dex_location_checksum != nullptr &&
+      oat_dex_file->GetDexFileLocationChecksum() != *dex_location_checksum) {
+    if (error_msg != nullptr) {
+      std::string dex_canonical_location = DexFileLoader::GetDexCanonicalLocation(dex_location);
+      std::string checksum = StringPrintf("0x%08x", oat_dex_file->GetDexFileLocationChecksum());
+      std::string required_checksum = StringPrintf("0x%08x", *dex_location_checksum);
+      *error_msg = "OatDexFile for DexFile " + std::string(dex_location)
+          + " (canonical path " + dex_canonical_location + ") in OatFile " + GetLocation()
+          + " has checksum " + checksum + " but " + required_checksum + " was required";
+    }
+    return nullptr;
+  }
+  return oat_dex_file;
+}
+```
