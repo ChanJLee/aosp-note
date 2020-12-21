@@ -873,3 +873,13 @@ const OatDexFile* OatFile::GetOatDexFile(const char* dex_location,
   return oat_dex_file;
 }
 ```
+
+这个方法回去找oat文件位置，首先会从两个内存缓存中去查找，如果都没找到，那么就要从磁盘上进行读取
+
+DexFileLoader::GetDexCanonicalLocation(dex_location); 会返回最终的dex文件位置, 缓存是在创建OatFile的时候同时创建的。
+
+
+总结一下，创建一个class loader的过程。
+
+1. 根据文件路径传递到c层
+2. c层将dex文件路径转化成OatFile， 核心是OatFileAssistant这个文件
