@@ -883,3 +883,122 @@ DexFileLoader::GetDexCanonicalLocation(dex_location); 会返回最终的dex文�
 
 1. 根据文件路径传递到c层
 2. c层将dex文件路径转化成OatFile， 核心是OatFileAssistant这个文件
+
+```cpp
+
+const OatFile* OatFileAssistant::OatFileInfo::GetFile() {
+  CHECK(!file_released_) << "GetFile called after oat file released.";
+  if (!load_attempted_) {
+    load_attempted_ = true;
+    if (filename_provided_) {
+      bool executable = oat_file_assistant_->load_executable_;
+      if (executable && oat_file_assistant_->only_load_system_executable_) {
+        executable = LocationIsOnSystem(filename_.c_str());
+      }
+      VLOG(oat) << "Loading " << filename_ << " with executable: " << executable;
+      std::string error_msg;
+      if (use_fd_) {
+        if (oat_fd_ >= 0 && vdex_fd_ >= 0) {
+          ArrayRef<const std::string> dex_locations(&oat_file_assistant_->dex_location_,
+                                                    /*size=*/ 1u);
+          file_.reset(OatFile::Open(zip_fd_,
+                                    vdex_fd_,
+                                    oat_fd_,
+                                    filename_.c_str(),
+                                    executable,
+                                    /*low_4gb=*/ false,
+                                    dex_locations,
+                                    /*reservation=*/ nullptr,
+                                    &error_msg));
+        }
+      } else {
+        file_.reset(OatFile::Open(/*zip_fd=*/ -1,
+                                  filename_.c_str(),
+                                  filename_.c_str(),
+                                  executable,
+                                  /*low_4gb=*/ false,
+                                  oat_file_assistant_->dex_location_,
+                                  &error_msg));
+      }
+      if (file_.get() == nullptr) {
+        VLOG(oat) << "OatFileAssistant test for existing oat file "
+          << filename_ << ": " << error_msg;
+      } else {
+        VLOG(oat) << "Successfully loaded " << filename_ << " with executable: " << executable;
+      }
+    }
+  }
+  return file_.get();
+}
+```
+
+核心是OatFile::Open函数
+
+```cpp
+OatFile* OatFile::Open(int zip_fd,
+                       const std::string& oat_filename,
+                       const std::string& oat_location,
+                       bool executable,
+                       bool low_4gb,
+                       ArrayRef<const std::string> dex_filenames,
+                       /*inout*/MemMap* reservation,
+                       /*out*/std::string* error_msg) {
+  ScopedTrace trace("Open oat file " + oat_location);
+  CHECK(!oat_filename.empty()) << oat_location;
+  CheckLocation(oat_location);
+
+  std::string vdex_filename = GetVdexFilename(oat_filename);
+
+  // Check that the files even exist, fast-fail.
+  if (!OS::FileExists(vdex_filename.c_str())) {
+    *error_msg = StringPrintf("File %s does not exist.", vdex_filename.c_str());
+    return nullptr;
+  } else if (!OS::FileExists(oat_filename.c_str())) {
+    *error_msg = StringPrintf("File %s does not exist.", oat_filename.c_str());
+    return nullptr;
+  }
+
+  // Try dlopen first, as it is required for native debuggability. This will fail fast if dlopen is
+  // disabled.
+  OatFile* with_dlopen = OatFileBase::OpenOatFile<DlOpenOatFile>(zip_fd,
+                                                                 vdex_filename,
+                                                                 oat_filename,
+                                                                 oat_location,
+                                                                 /*writable=*/ false,
+                                                                 executable,
+                                                                 low_4gb,
+                                                                 dex_filenames,
+                                                                 reservation,
+                                                                 error_msg);
+  if (with_dlopen != nullptr) {
+    return with_dlopen;
+  }
+  if (kPrintDlOpenErrorMessage) {
+    LOG(ERROR) << "Failed to dlopen: " << oat_filename << " with error " << *error_msg;
+  }
+  // If we aren't trying to execute, we just use our own ElfFile loader for a couple reasons:
+  //
+  // On target, dlopen may fail when compiling due to selinux restrictions on installd.
+  //
+  // We use our own ELF loader for Quick to deal with legacy apps that
+  // open a generated dex file by name, remove the file, then open
+  // another generated dex file with the same name. http://b/10614658
+  //
+  // On host, dlopen is expected to fail when cross compiling, so fall back to ElfOatFile.
+  //
+  //
+  // Another independent reason is the absolute placement of boot.oat. dlopen on the host usually
+  // does honor the virtual address encoded in the ELF file only for ET_EXEC files, not ET_DYN.
+  OatFile* with_internal = OatFileBase::OpenOatFile<ElfOatFile>(zip_fd,
+                                                                vdex_filename,
+                                                                oat_filename,
+                                                                oat_location,
+                                                                /*writable=*/ false,
+                                                                executable,
+                                                                low_4gb,
+                                                                dex_filenames,
+                                                                reservation,
+                                                                error_msg);
+  return with_internal;
+}
+```
