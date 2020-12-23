@@ -1002,3 +1002,133 @@ OatFile* OatFile::Open(int zip_fd,
   return with_internal;
 }
 ```
+
+核心是  OatFileBase::OpenOatFile， 他有两种打开方式，一个是dlopen的形式，一个是elf的形式
+
+```cpp
+template <typename kOatFileBaseSubType>
+OatFileBase* OatFileBase::OpenOatFile(int zip_fd,
+                                      int vdex_fd,
+                                      int oat_fd,
+                                      const std::string& vdex_location,
+                                      const std::string& oat_location,
+                                      bool writable,
+                                      bool executable,
+                                      bool low_4gb,
+                                      ArrayRef<const std::string> dex_filenames,
+                                      /*inout*/MemMap* reservation,
+                                      /*out*/std::string* error_msg) {
+  std::unique_ptr<OatFileBase> ret(new kOatFileBaseSubType(oat_location, executable));
+
+  if (!ret->Load(oat_fd,
+                 writable,
+                 executable,
+                 low_4gb,
+                 reservation,
+                 error_msg)) {
+    return nullptr;
+  }
+
+  if (!ret->ComputeFields(oat_location, error_msg)) {
+    return nullptr;
+  }
+
+  ret->PreSetup(oat_location);
+
+  if (!ret->LoadVdex(vdex_fd, vdex_location, writable, low_4gb, error_msg)) {
+    return nullptr;
+  }
+
+  if (!ret->Setup(zip_fd, dex_filenames, error_msg)) {
+    return nullptr;
+  }
+
+  return ret.release();
+}
+```
+
+kOatFileBaseSubType 其实就是上述两个类型。我们先看dlopen
+
+```cpp
+class DlOpenOatFile final : public OatFileBase {
+ public:
+  DlOpenOatFile(const std::string& filename, bool executable)
+      : OatFileBase(filename, executable),
+        dlopen_handle_(nullptr),
+        shared_objects_before_(0) {
+  }
+
+  ~DlOpenOatFile() {
+    if (dlopen_handle_ != nullptr) {
+      if (!kIsTargetBuild) {
+        MutexLock mu(Thread::Current(), *Locks::host_dlopen_handles_lock_);
+        host_dlopen_handles_.erase(dlopen_handle_);
+        dlclose(dlopen_handle_);
+      } else {
+        dlclose(dlopen_handle_);
+      }
+    }
+  }
+
+ protected:
+  const uint8_t* FindDynamicSymbolAddress(const std::string& symbol_name,
+                                          std::string* error_msg) const override {
+    const uint8_t* ptr =
+        reinterpret_cast<const uint8_t*>(dlsym(dlopen_handle_, symbol_name.c_str()));
+    if (ptr == nullptr) {
+      *error_msg = dlerror();
+    }
+    return ptr;
+  }
+
+  void PreLoad() override;
+
+  bool Load(const std::string& elf_filename,
+            bool writable,
+            bool executable,
+            bool low_4gb,
+            /*inout*/MemMap* reservation,  // Where to load if not null.
+            /*out*/std::string* error_msg) override;
+
+  bool Load(int oat_fd ATTRIBUTE_UNUSED,
+            bool writable ATTRIBUTE_UNUSED,
+            bool executable ATTRIBUTE_UNUSED,
+            bool low_4gb ATTRIBUTE_UNUSED,
+            /*inout*/MemMap* reservation ATTRIBUTE_UNUSED,
+            /*out*/std::string* error_msg ATTRIBUTE_UNUSED) override {
+    return false;
+  }
+
+  // Ask the linker where it mmaped the file and notify our mmap wrapper of the regions.
+  void PreSetup(const std::string& elf_filename) override;
+
+ private:
+  bool Dlopen(const std::string& elf_filename,
+              /*inout*/MemMap* reservation,  // Where to load if not null.
+              /*out*/std::string* error_msg);
+
+  // On the host, if the same library is loaded again with dlopen the same
+  // file handle is returned. This differs from the behavior of dlopen on the
+  // target, where dlopen reloads the library at a different address every
+  // time you load it. The runtime relies on the target behavior to ensure
+  // each instance of the loaded library has a unique dex cache. To avoid
+  // problems, we fall back to our own linker in the case when the same
+  // library is opened multiple times on host. dlopen_handles_ is used to
+  // detect that case.
+  // Guarded by host_dlopen_handles_lock_;
+  static std::unordered_set<void*> host_dlopen_handles_;
+
+  // Reservation and placeholder memory map objects corresponding to the regions mapped by dlopen.
+  // Note: Must be destroyed after dlclose() as it can hold the owning reservation.
+  std::vector<MemMap> dlopen_mmaps_;
+
+  // dlopen handle during runtime.
+  void* dlopen_handle_;  // TODO: Unique_ptr with custom deleter.
+
+  // The number of shared objects the linker told us about before loading. Used to
+  // (optimistically) optimize the PreSetup stage (see comment there).
+  size_t shared_objects_before_;
+
+  DISALLOW_COPY_AND_ASSIGN(DlOpenOatFile);
+};
+```
