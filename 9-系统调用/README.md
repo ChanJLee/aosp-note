@@ -118,8 +118,9 @@ asmlinkage long SySkill(long pid, long sig);
 asmlinkage long SySkill(long pid, long sig)
 {
 	long ret = SYSCkill((pid_t) pid, (int) sig);
-	__MAP(x,__SC_TEST,__VA_ARGS__);				\\ ??
-	__PROTECT(x, ret,__MAP(x,__SC_ARGS,__VA_ARGS__));	??
+	// 做检测，检测每一个参数的长度都是小于long的大小，防止溢出
+	__MAP(x,__SC_TEST,__VA_ARGS__);
+	__PROTECT(x, ret,__MAP(x,__SC_ARGS,__VA_ARGS__));
 	return ret;	
 }
 static inline long SYSCkill(pid_t pid, int sig)
@@ -131,3 +132,13 @@ static inline long SYSCkill(pid_t pid, int sig)
 	return kill_something_info(sig, &info, pid);
 }
 ```
+
+其中 为什么要先把long类型的参数转成pid以及int类型呢？是为了将寄存器的高位清0，这个在是为了修复一个CVE漏洞。
+
+./common/include/linux/bug.h
+
+```cpp
+#define BUILD_BUG_ON_ZERO(e) (sizeof(struct { int:-!!(e); }))
+```
+
+__SC_TEST如果传递true给BUILD_BUG_ON_ZERO，那么会导致一个位域的编译错误，这个在编译期间就能检查的到。
