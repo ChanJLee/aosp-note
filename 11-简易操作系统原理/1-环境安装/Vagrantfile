@@ -96,7 +96,8 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
 
   $script = %Q{
     sudo apt-get update
-    sudo apt-get install nasm make build-essential grub qemu zip -y --force-yes
+    sudo apt-get install nasm make build-essential grub zip -y --force-yes
+    sudo apt-get install qemu -y --force-yes --fix-missing
   }
 
   
