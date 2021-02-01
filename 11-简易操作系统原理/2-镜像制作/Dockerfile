@@ -1,4 +1,4 @@
-FROM ubuntu:10.04
+FROM chrismacp/ubuntu-10.04
 
 RUN apt-get update
 RUN apt-get install nasm make build-essential grub zip git -y --force-yes
