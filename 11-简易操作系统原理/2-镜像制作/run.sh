@@ -2,7 +2,12 @@
 
 source env.sh
 
-docker run -d \
+docker container ls -a | grep os-make | awk '{print $1}' | xargs docker container rm -f
+
+src=`pwd`/src
+
+docker run -it \
   --name=os-make \
-  --mount 'type=volume,source=How-to-Make-a-Computer-Operating-System/src,target=/mirror' \
-  ${IMAGE_NAME}
+  --mount "type=bind,src=${src},dst=/mirror" \
+  ${IMAGE_NAME} \
+  bash -c "cd /mirror && ls -l && make all && make run"
